@@ -59,6 +59,58 @@ def filter_todos(
     return result
 
 
+# -- category / tag filtering ----------------------------------------------
+def filter_by_category(todos: Iterable[Todo], category: str) -> List[Todo]:
+    """Return todos whose category matches ``category`` (case-insensitive).
+
+    Matching ignores surrounding whitespace and case so ``Work`` and ``work``
+    are treated as the same category. An empty/blank ``category`` returns all
+    todos unchanged.
+    """
+    needle = (category or "").strip().lower()
+    if not needle:
+        return list(todos)
+    return [t for t in todos if t.category.strip().lower() == needle]
+
+
+def filter_by_tag(todos: Iterable[Todo], tag: str) -> List[Todo]:
+    """Return todos that contain ``tag`` (case-insensitive).
+
+    An empty/blank ``tag`` returns all todos unchanged.
+    """
+    needle = (tag or "").strip().lower()
+    if not needle:
+        return list(todos)
+    return [
+        t for t in todos
+        if any(existing.strip().lower() == needle for existing in t.tags)
+    ]
+
+
+def category_counts(todos: Iterable[Todo]) -> "list[tuple[str, int]]":
+    """Return ``(category, count)`` pairs for every unique category.
+
+    Categories are reported case-insensitively using the first-seen casing.
+    Todos with no category are grouped under the label ``(none)``. The result
+    is sorted alphabetically by the lowercased category name, with ``(none)``
+    always sorted last.
+    """
+    counts: dict[str, int] = {}
+    display: dict[str, str] = {}
+    for t in todos:
+        raw = t.category.strip()
+        key = raw.lower() if raw else ""
+        if key not in display:
+            display[key] = raw if raw else "(none)"
+        counts[key] = counts.get(key, 0) + 1
+
+    def sort_key(key: str) -> tuple:
+        # Empty category key sorts last.
+        return (key == "", key)
+
+    return [(display[k], counts[k]) for k in sorted(counts, key=sort_key)]
+
+
 # -- sorting ---------------------------------------------------------------
 def sort_todos(todos: Iterable[Todo], key: str) -> List[Todo]:
     """Return a new list of ``todos`` sorted by ``key``.

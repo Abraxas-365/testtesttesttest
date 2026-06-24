@@ -12,9 +12,13 @@ import argparse
 import sys
 from typing import List
 
+from export import to_csv, to_markdown
 from filters import (
     bar,
+    category_counts,
     compute_stats,
+    filter_by_category,
+    filter_by_tag,
     filter_todos,
     is_overdue,
     search_todos,
@@ -58,15 +62,37 @@ def _use_color(stream) -> bool:
     return hasattr(stream, "isatty") and stream.isatty()
 
 
+def _parse_tags(raw: str | None) -> List[str]:
+    """Split a comma-separated ``--tags`` value into a clean list."""
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 def cmd_add(store: Store, args: argparse.Namespace) -> int:
-    todo = Todo(title=args.title, priority=args.priority, due_date=args.due)
+    todo = Todo(
+        title=args.title,
+        priority=args.priority,
+        due_date=args.due,
+        category=getattr(args, "category", "") or "",
+        tags=_parse_tags(getattr(args, "tags", None)),
+    )
     store.add(todo)
     enabled = _use_color(sys.stdout)
     color = PRIORITY_COLORS[todo.priority]
+    extras = ""
+    if todo.category:
+        extras += " " + _color(f"@{todo.category}", CYAN, enabled)
+    if todo.tags:
+        extras += " " + _color(
+            " ".join(f"#{tag}" for tag in todo.tags), GREEN, enabled
+        )
     print(
         "Added "
         + _color(f"[{todo.priority}]", color, enabled)
-        + f" {todo.title} "
+        + f" {todo.title}"
+        + extras
+        + " "
         + _color(f"({todo.id[:8]})", DIM, enabled)
     )
     return 0
@@ -108,6 +134,12 @@ def _apply_filters_and_sort(
     status = getattr(args, "filter", "all") or "all"
     priority = getattr(args, "priority", None)
     todos = filter_todos(todos, status=status, priority=priority)
+    category = getattr(args, "category", None)
+    if category:
+        todos = filter_by_category(todos, category)
+    tag = getattr(args, "tag", None)
+    if tag:
+        todos = filter_by_tag(todos, tag)
     sort_key = getattr(args, "sort", None)
     if sort_key:
         todos = sort_todos(todos, sort_key)
@@ -169,6 +201,31 @@ def cmd_stats(store: Store, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_categories(store: Store, args: argparse.Namespace) -> int:
+    enabled = _use_color(sys.stdout)
+    pairs = category_counts(store.list())
+    if not pairs:
+        print(_color("No todos yet.", DIM, enabled))
+        return 0
+    title = "Categories" if not enabled else _color("Categories", BOLD, enabled)
+    print(title)
+    print(_color("=" * 30, DIM, enabled))
+    for name, count in pairs:
+        label = name if name == "(none)" else f"@{name}"
+        print(f"  {_color(label, CYAN, enabled)}  {count}")
+    return 0
+
+
+def cmd_export(store: Store, args: argparse.Namespace) -> int:
+    todos = store.list()
+    if args.format == "csv":
+        # csv text already contains its own line terminators.
+        sys.stdout.write(to_csv(todos))
+    else:  # markdown
+        sys.stdout.write(to_markdown(todos))
+    return 0
+
+
 def cmd_done(store: Store, args: argparse.Namespace) -> int:
     enabled = _use_color(sys.stdout)
     try:
@@ -225,6 +282,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument(
         "--due", default=None, help="Optional due date (YYYY-MM-DD)"
     )
+    p_add.add_argument(
+        "--category", default="", help="Optional category label (e.g. work)"
+    )
+    p_add.add_argument(
+        "--tags",
+        default=None,
+        help="Comma-separated tags (e.g. reading,evening)",
+    )
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list", help="List all todos")
@@ -246,6 +311,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Sort by priority (high first), due date (soonest first) or created",
     )
+    p_list.add_argument(
+        "--category",
+        default=None,
+        help="Show only todos in this category (case-insensitive)",
+    )
+    p_list.add_argument(
+        "--tag",
+        default=None,
+        help="Show only todos that have this tag (case-insensitive)",
+    )
     p_list.set_defaults(func=cmd_list)
 
     p_search = sub.add_parser(
@@ -256,6 +331,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="Show a summary dashboard")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_categories = sub.add_parser(
+        "categories", help="List all unique categories with todo counts"
+    )
+    p_categories.set_defaults(func=cmd_categories)
+
+    p_export = sub.add_parser(
+        "export", help="Export all todos to stdout (CSV or Markdown)"
+    )
+    p_export.add_argument(
+        "--format",
+        choices=("csv", "markdown"),
+        default="csv",
+        help="Export format (default: csv)",
+    )
+    p_export.set_defaults(func=cmd_export)
 
     p_done = sub.add_parser("done", help="Mark a todo as done")
     p_done.add_argument("id_prefix", help="First few characters of the todo id")
