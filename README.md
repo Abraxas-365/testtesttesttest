@@ -63,3 +63,38 @@ go test ./... -v
 
 The test suite runs against a real PostgreSQL instance. Set `DB_HOST`/`DB_PORT`
 to point at your database; tests that cannot reach the database are skipped.
+
+## React Dashboard (`frontend/`)
+
+A Vite + React + TypeScript dashboard that talks to the Go API. It shows a
+table of all expenses, a form to add new ones, and a recharts pie chart of
+spending per category. Styling is plain CSS.
+
+### Features
+
+- Table of expenses (date, category, amount, description, delete button)
+- Add-expense form (amount, category dropdown, description, date picker)
+- Pie chart of total spending per category (recharts)
+- Delete button removes an expense and refreshes the table and chart
+
+### Running
+
+```sh
+cd frontend
+npm install
+npm run dev   # http://localhost:5173
+```
+
+The Vite dev server proxies `/api` to `http://localhost:8080`, so start the Go
+API first (`go run .`).
+
+### E2E tests (Playwright)
+
+```sh
+cd frontend
+npm run test:e2e
+```
+
+The Playwright config auto-starts the Vite dev server. The test exercises the
+empty state, adding expenses, the pie chart, and deletion, saving screenshots
+to `/workspace/proof/`.
