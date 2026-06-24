@@ -1,3 +1,3 @@
-# Test Project
+# Todo App
 
-This is a test project for Yatai pipeline testing.
+A modern CLI todo application built with Python.
