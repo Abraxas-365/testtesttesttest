@@ -1,0 +1,53 @@
+# Docker Compose for the Task Manager full stack.
+#
+#   - api: the Go REST API (SQLite), listening on :8080
+#   - web: nginx serving the built React SPA on :80 and proxying /api -> api
+#
+# Usage:
+#   docker compose up --build
+#   open http://localhost:8080
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: taskmanager-api
+    # SQLite data persists across restarts in a named volume.
+    volumes:
+      - api-data:/data
+    # Exposed mainly so the API can be exercised directly (e.g. integration
+    # tests / curl). The web service reaches it over the internal network.
+    expose:
+      - "8080"
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+    healthcheck:
+      # The API has no dedicated health endpoint; GET /api/tasks returns 200
+      # once the server and schema are ready.
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/tasks"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: taskmanager-web
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  api-data:
