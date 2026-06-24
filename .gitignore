@@ -1,0 +1,7 @@
+# Binaries
+/expense-tracker
+*.exe
+
+# Go build/test cache
+/tmp/
+.claudio/
