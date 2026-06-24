@@ -12,6 +12,14 @@ import argparse
 import sys
 from typing import List
 
+from filters import (
+    bar,
+    compute_stats,
+    filter_todos,
+    is_overdue,
+    search_todos,
+    sort_todos,
+)
 from store import Store
 from todo import PRIORITIES, Todo
 
@@ -85,15 +93,79 @@ def _format_table(todos: List[Todo], enabled: bool) -> str:
         if t.done:
             title = _color(title, DIM, enabled)
         due = t.due_date or "-"
+        if is_overdue(t):
+            due = _color(due, RED, enabled)
         lines.append(
             f"{checkbox:<3} {t.id[:8]:<8} {indicator:<5} {title:<30} {due:<12}"
         )
     return "\n".join(lines)
 
 
+def _apply_filters_and_sort(
+    todos: List[Todo], args: argparse.Namespace
+) -> List[Todo]:
+    """Apply --filter, --priority and --sort options to ``todos``."""
+    status = getattr(args, "filter", "all") or "all"
+    priority = getattr(args, "priority", None)
+    todos = filter_todos(todos, status=status, priority=priority)
+    sort_key = getattr(args, "sort", None)
+    if sort_key:
+        todos = sort_todos(todos, sort_key)
+    return todos
+
+
 def cmd_list(store: Store, args: argparse.Namespace) -> int:
-    todos = store.list()
+    todos = _apply_filters_and_sort(store.list(), args)
     print(_format_table(todos, _use_color(sys.stdout)))
+    return 0
+
+
+def cmd_search(store: Store, args: argparse.Namespace) -> int:
+    matches = search_todos(store.list(), args.query)
+    enabled = _use_color(sys.stdout)
+    if not matches:
+        print(
+            _color(f"No todos match '{args.query}'.", DIM, enabled),
+        )
+        return 0
+    label = "match" if len(matches) == 1 else "matches"
+    print(
+        _color(f"{len(matches)} {label} for '{args.query}':", BOLD, enabled)
+        if enabled
+        else f"{len(matches)} {label} for '{args.query}':"
+    )
+    print(_format_table(matches, enabled))
+    return 0
+
+
+def cmd_stats(store: Store, args: argparse.Namespace) -> int:
+    enabled = _use_color(sys.stdout)
+    todos = store.list()
+    stats = compute_stats(todos)
+
+    title = _color("Todo Statistics", BOLD, enabled) if enabled else "Todo Statistics"
+    print(title)
+    print(_color("=" * 30, DIM, enabled))
+    print(f"  Total:   {stats['total']}")
+    print(f"  Done:    " + _color(str(stats['done']), GREEN, enabled))
+    print(f"  Pending: " + _color(str(stats['pending']), CYAN, enabled))
+    print(
+        f"  Overdue: "
+        + _color(str(stats['overdue']), RED, enabled)
+    )
+
+    print()
+    header = "By priority:"
+    print(_color(header, BOLD, enabled) if enabled else header)
+    total = stats["total"]
+    for priority in PRIORITIES:
+        count = stats["by_priority"][priority]
+        chart = bar(count, total)
+        color = PRIORITY_COLORS[priority]
+        print(
+            f"  {_color(f'{priority:<7}', color, enabled)} "
+            f"{_color(chart, color, enabled)} {count}"
+        )
     return 0
 
 
@@ -156,7 +228,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list", help="List all todos")
+    p_list.add_argument(
+        "--filter",
+        choices=("all", "done", "pending"),
+        default="all",
+        help="Filter by status (default: all)",
+    )
+    p_list.add_argument(
+        "--priority",
+        choices=PRIORITIES,
+        default=None,
+        help="Show only todos with this priority",
+    )
+    p_list.add_argument(
+        "--sort",
+        choices=("priority", "due", "created"),
+        default=None,
+        help="Sort by priority (high first), due date (soonest first) or created",
+    )
     p_list.set_defaults(func=cmd_list)
+
+    p_search = sub.add_parser(
+        "search", help="Case-insensitive substring search on titles"
+    )
+    p_search.add_argument("query", help="Text to search for in todo titles")
+    p_search.set_defaults(func=cmd_search)
+
+    p_stats = sub.add_parser("stats", help="Show a summary dashboard")
+    p_stats.set_defaults(func=cmd_stats)
 
     p_done = sub.add_parser("done", help="Mark a todo as done")
     p_done.add_argument("id_prefix", help="First few characters of the todo id")
