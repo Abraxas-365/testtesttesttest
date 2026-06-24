@@ -1,128 +1,214 @@
 #!/usr/bin/env bash
 #
-# Integration test for the Task Manager full stack.
+# Integration test for the full Task Manager stack.
 #
-# It builds and starts the docker-compose stack (Go API + nginx/React web),
-# then verifies the full request path end to end:
+# Brings up the docker-compose stack (Go API + nginx-served React frontend),
+# waits for both services to report healthy, then exercises the end-to-end
+# request flow THROUGH the nginx proxy (the only port published to the host).
 #
-#   1. Wait for the web (nginx) and api services to become healthy.
-#   2. Create a task by POSTing through nginx (/api/tasks) -> Go API.
-#   3. GET /api/tasks through nginx and assert the new task appears.
-#   4. Confirm the web service serves the SPA index.html.
-#   5. Tear the stack down (containers + volumes) on exit.
+# Prerequisites on the host: docker, docker compose, curl, jq.
 #
-# All requests are issued from a throwaway container attached to the compose
-# network, so the test does not depend on host port publishing being reachable
-# from wherever the script runs.
-set -uo pipefail
+set -euo pipefail
 
+# Always run from the repo root (directory of this script).
 cd "$(dirname "$0")"
 
-PROJECT="taskmgr_itest"
-COMPOSE=(docker compose -p "$PROJECT")
-NETWORK="${PROJECT}_default"
-# Lightweight image used to run curl from inside the compose network.
-CURL_IMG="curlimages/curl:8.10.1"
+# Host port that the nginx "web" service is published on (see docker-compose.yml).
+# In a normal environment the tests run against this published port. When the
+# test runner is itself a Docker container that shares the host's daemon (so
+# published ports are NOT on this container's localhost), resolve_base_url()
+# transparently falls back to reaching the "web" service over the compose
+# network instead. WEB is assigned by resolve_base_url() after the stack is up.
+WEB=""
+PUBLISHED_WEB="http://localhost:8081"
+
+# Network this container joined (for cleanup), if any.
+JOINED_NET=""
 
 PASS=0
 FAIL=0
 
-log()  { printf '\n>>> %s\n' "$*"; }
-ok()   { printf '    [PASS] %s\n' "$*"; PASS=$((PASS+1)); }
-bad()  { printf '    [FAIL] %s\n' "$*"; FAIL=$((FAIL+1)); }
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: required command '$1' is not installed on the host." >&2
+    exit 1
+  }
+}
 
 cleanup() {
-  log "Cleaning up: docker compose down -v"
-  "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  echo
+  echo "--- Cleaning up containers and volumes ---"
+  # If we joined the compose network to reach the stack, leave it first.
+  if [[ -n "$JOINED_NET" ]]; then
+    local self
+    self="$(self_container_id || true)"
+    [[ -n "$self" ]] && docker network disconnect "$JOINED_NET" "$self" 2>/dev/null || true
+  fi
+  docker compose down -v --remove-orphans || true
 }
 trap cleanup EXIT
 
-# Run curl inside the compose network. Usage: incurl <curl args...>
-incurl() {
-  docker run --rm --network "$NETWORK" "$CURL_IMG" -s "$@"
+# self_container_id prints this process's container ID if we are running inside
+# a container, otherwise prints nothing.
+self_container_id() {
+  if [[ -f /proc/self/cgroup ]]; then
+    local id
+    id="$(grep -oE '[0-9a-f]{64}' /proc/self/cgroup 2>/dev/null | head -1)"
+    [[ -n "$id" ]] && { echo "$id"; return 0; }
+  fi
+  # Fallback: the short hostname is the container ID for default Docker setups.
+  local hn
+  hn="$(cat /etc/hostname 2>/dev/null || hostname)"
+  if docker inspect "$hn" >/dev/null 2>&1; then
+    echo "$hn"
+  fi
 }
 
-log "Docker / Compose versions"
-docker --version
-docker compose version
+# resolve_base_url determines a reachable base URL for the nginx web service and
+# assigns it to the global WEB. It prefers the published host port; if that is
+# unreachable (e.g. running from a sibling container), it joins the compose
+# network and targets the service by name.
+resolve_base_url() {
+  if curl -fsS -m 3 -o /dev/null "$PUBLISHED_WEB/"; then
+    WEB="$PUBLISHED_WEB"
+    echo "Using published host port: $WEB"
+    return 0
+  fi
 
-log "Building and starting the stack (docker compose up -d --build)"
-if ! "${COMPOSE[@]}" up -d --build; then
-  bad "docker compose up failed"
-  "${COMPOSE[@]}" ps
-  exit 1
-fi
-ok "compose stack started"
-
-# Pre-pull the curl helper image so timing/output is clean.
-docker pull -q "$CURL_IMG" >/dev/null 2>&1 || true
-
-log "Waiting for services to become healthy"
-wait_healthy() {
-  local svc="$1" cid status
-  cid="$("${COMPOSE[@]}" ps -q "$svc")"
-  if [ -z "$cid" ]; then bad "service '$svc' has no container"; return 1; fi
-  for _ in $(seq 1 40); do
-    status="$(docker inspect -f '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}{{ .State.Status }}{{ end }}' "$cid" 2>/dev/null)"
-    case "$status" in
-      healthy|running) ok "service '$svc' is $status"; return 0 ;;
-      unhealthy|exited|dead) bad "service '$svc' is $status"; return 1 ;;
-    esac
-    sleep 3
-  done
-  bad "service '$svc' did not become healthy in time (last: ${status:-unknown})"
+  echo "Published port $PUBLISHED_WEB is not reachable; trying the compose network..."
+  local self net
+  self="$(self_container_id || true)"
+  if [[ -z "$self" ]]; then
+    echo "ERROR: web service is not reachable on $PUBLISHED_WEB and we are not running in a container to join the compose network." >&2
+    return 1
+  fi
+  net="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$(docker compose ps -q web)")"
+  if [[ -z "$net" ]]; then
+    echo "ERROR: could not determine the compose network for the web service." >&2
+    return 1
+  fi
+  docker network connect "$net" "$self" 2>/dev/null || true
+  JOINED_NET="$net"
+  if curl -fsS -m 5 -o /dev/null "http://web/"; then
+    WEB="http://web"
+    echo "Reaching web service over compose network '$net' as: $WEB"
+    return 0
+  fi
+  echo "ERROR: web service is not reachable over the compose network." >&2
   return 1
 }
 
-if ! wait_healthy api;  then "${COMPOSE[@]}" logs api;  exit 1; fi
-if ! wait_healthy web;  then "${COMPOSE[@]}" logs web;  exit 1; fi
+# ---- Preflight ----
+require docker
+require curl
+require jq
+docker compose version >/dev/null 2>&1 || {
+  echo "ERROR: 'docker compose' plugin is not available." >&2
+  exit 1
+}
 
-TITLE="integration-test-task-$(date +%s)"
-DESC="created by test.sh"
+# ---- Wait for a service to become healthy ----
+wait_healthy() {
+  local svc="$1"
+  local attempts=40
+  local cid
+  for ((i = 1; i <= attempts; i++)); do
+    cid="$(docker compose ps -q "$svc" 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+      local status
+      status="$(docker inspect -f '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}{{ .State.Status }}{{ end }}' "$cid" 2>/dev/null || echo "unknown")"
+      case "$status" in
+        healthy | running)
+          echo "service '$svc' is $status"
+          return 0
+          ;;
+        unhealthy | exited | dead)
+          echo "ERROR: service '$svc' is '$status'." >&2
+          docker compose logs "$svc" || true
+          return 1
+          ;;
+      esac
+    fi
+    sleep 3
+  done
+  echo "ERROR: timed out waiting for service '$svc' to become healthy." >&2
+  docker compose logs "$svc" || true
+  return 1
+}
 
-log "Creating a task via nginx (POST http://web/api/tasks)"
-CREATE_RESP="$(incurl -X POST http://web/api/tasks \
+echo "=== Building and starting the stack ==="
+docker compose up -d --build
+
+echo
+echo "=== Waiting for services to be healthy ==="
+wait_healthy api
+wait_healthy web
+
+echo
+echo "=== Resolving a reachable base URL for the web service ==="
+resolve_base_url
+
+echo
+echo "=== Running integration tests (through nginx at $WEB) ==="
+
+# 1. The SPA index is served by nginx.
+if curl -fsS "$WEB/" | grep -qi '<div id="root"></div>'; then
+  pass "SPA index.html is served by nginx"
+else
+  fail "SPA index.html is served by nginx"
+fi
+
+# 2. Create a task via the nginx -> api proxy.
+CREATE_BODY='{"title":"Integration test task","description":"created via test.sh"}'
+CREATE_RES="$(curl -fsS -X POST "$WEB/api/tasks" \
   -H 'Content-Type: application/json' \
-  -d "{\"title\":\"${TITLE}\",\"description\":\"${DESC}\"}")"
-echo "    response: ${CREATE_RESP}"
-
-NEW_ID="$(printf '%s' "$CREATE_RESP" | jq -r '.id // empty' 2>/dev/null)"
-if [ -n "$NEW_ID" ] && printf '%s' "$CREATE_RESP" | jq -e --arg t "$TITLE" '.title == $t' >/dev/null 2>&1; then
-  ok "task created with id=${NEW_ID}"
+  -d "$CREATE_BODY")"
+NEW_ID="$(echo "$CREATE_RES" | jq -r '.id')"
+if [[ -n "$NEW_ID" && "$NEW_ID" != "null" ]]; then
+  pass "POST /api/tasks created task id=$NEW_ID through nginx proxy"
 else
-  bad "task creation did not return expected JSON"
+  fail "POST /api/tasks did not return a valid id (response: $CREATE_RES)"
 fi
 
-log "Listing tasks via nginx (GET http://web/api/tasks)"
-LIST_RESP="$(incurl http://web/api/tasks)"
-echo "    response: ${LIST_RESP}"
-
-if printf '%s' "$LIST_RESP" | jq -e --arg t "$TITLE" 'any(.[]; .title == $t)' >/dev/null 2>&1; then
-  ok "created task appears in GET /api/tasks"
+# 3. The created task title round-trips correctly.
+if [[ "$(echo "$CREATE_RES" | jq -r '.title')" == "Integration test task" ]]; then
+  pass "Created task has the expected title"
 else
-  bad "created task NOT found in GET /api/tasks"
+  fail "Created task title mismatch (response: $CREATE_RES)"
 fi
 
-log "Verifying nginx serves the SPA (GET http://web/)"
-INDEX_RESP="$(incurl http://web/)"
-if printf '%s' "$INDEX_RESP" | grep -qi '<div id="root"'; then
-  ok "web service serves index.html with #root mount point"
+# 4. List tasks and confirm the new task is present.
+LIST_RES="$(curl -fsS "$WEB/api/tasks")"
+if echo "$LIST_RES" | jq -e --arg id "$NEW_ID" 'map(.id == ($id | tonumber)) | any' >/dev/null; then
+  pass "GET /api/tasks lists the created task through nginx proxy"
 else
-  bad "web service did not serve the expected SPA index.html"
+  fail "GET /api/tasks did not list task id=$NEW_ID (response: $LIST_RES)"
 fi
 
-log "Verifying API persistence path directly (GET http://api:8080/api/tasks)"
-API_DIRECT="$(incurl http://api:8080/api/tasks)"
-if printf '%s' "$API_DIRECT" | jq -e --arg t "$TITLE" 'any(.[]; .title == $t)' >/dev/null 2>&1; then
-  ok "task also visible directly from the Go API container"
+# 5. Toggle the task done via PUT through the proxy.
+UPDATE_RES="$(curl -fsS -X PUT "$WEB/api/tasks/$NEW_ID" \
+  -H 'Content-Type: application/json' \
+  -d '{"done":true}')"
+if [[ "$(echo "$UPDATE_RES" | jq -r '.done')" == "true" ]]; then
+  pass "PUT /api/tasks/$NEW_ID marked the task done through nginx proxy"
 else
-  bad "task not visible directly from the Go API container"
+  fail "PUT did not mark the task done (response: $UPDATE_RES)"
 fi
 
-log "RESULTS: ${PASS} passed, ${FAIL} failed"
-if [ "$FAIL" -ne 0 ]; then
-  echo "INTEGRATION TEST FAILED"
+# 6. Delete the task (cleanup of test data) and confirm 204.
+DEL_CODE="$(curl -fsS -o /dev/null -w '%{http_code}' -X DELETE "$WEB/api/tasks/$NEW_ID")"
+if [[ "$DEL_CODE" == "204" ]]; then
+  pass "DELETE /api/tasks/$NEW_ID returned 204 through nginx proxy"
+else
+  fail "DELETE returned $DEL_CODE (expected 204)"
+fi
+
+echo
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [[ "$FAIL" -ne 0 ]]; then
   exit 1
 fi
-echo "INTEGRATION TEST PASSED"
-exit 0
+echo "All integration tests passed."
