@@ -51,10 +51,24 @@ export default function App() {
   }
 
   const handleToggle = async (task: Task) => {
+    const nextDone = !task.done
+    // Optimistically flip the checkbox so the controlled <input> updates in the
+    // same React commit as the click. Without this the toggle only takes effect
+    // after the async updateTask + refresh round-trip, which makes the checkbox
+    // appear to revert and breaks tools (e.g. Playwright's check()) that expect
+    // the click to change the checked state synchronously.
+    setTasks((prev) =>
+      prev.map((t) => (t.id === task.id ? { ...t, done: nextDone } : t)),
+    )
     try {
-      await updateTask(task.id, { done: !task.done })
-      await refresh()
+      const updated = await updateTask(task.id, { done: nextDone })
+      setTasks((prev) => prev.map((t) => (t.id === task.id ? updated : t)))
+      setError(null)
     } catch (err) {
+      // Roll back the optimistic change on failure.
+      setTasks((prev) =>
+        prev.map((t) => (t.id === task.id ? { ...t, done: task.done } : t)),
+      )
       setError(err instanceof Error ? err.message : 'Failed to update task')
     }
   }
